@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1e3a8a">
+    <meta name="description" content="DUH-ROAD Bike Taxi - Fast, Reliable, Affordable Transportation">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="DUH-ROAD">
+    <title>DUH-ROAD Bike Taxi</title>
+    <link rel="manifest" href="data:application/json;base64,ewogICJuYW1lIjogIkRVSC1ST0FEIEJpa2UgVGF4aSIsCiAgInNob3J0X25hbWUiOiAiRFVILVJPQUQiLAogICJkZXNjcmlwdGlvbiI6ICJGYXN0LCBSZWxpYWJsZSwgQWZmb3JkYWJsZSBUcmFuc3BvcnRhdGlvbiIsCiAgInN0YXJ0X3VybCI6ICIvIiwKICAiZGlzcGxheSI6ICJzdGFuZGFsb25lIiwKICAiYmFja2dyb3VuZF9jb2xvciI6ICIjMWUzYThhIiwKICAidGhlbWVfY29sb3IiOiAiIzFlM2E4YSIsCiAgImljb25zIjogWwogICAgewogICAgICAic3JjIjogImRhdGE6aW1hZ2Uvc3ZnK3htbCwlM0NzdmcgeG1sbnM9J2h0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnJyB3aWR0aD0nMTkyJyBoZWlnaHQ9JzE5Mic%2BJTNDcmVjdCB3aWR0aD0nMTkyJyBoZWlnaHQ9JzE5MicgZmlsbD0nJTIzMWUzYThhJy8%2BJTNDdGV4dCB4PSc1MCUyNScgeT0nNTAlMjUnIGZvbnQtc2l6ZT0nODAnIGZpbGw9JyUyM2ZiYjYxNycgZm9udC1mYW1pbHk9J0FyaWFsJyB0ZXh0LWFuY2hvcj0nbWlkZGxlJyBkb21pbmFudC1iYXNlbGluZT0nbWlkZGxlJyUzRUQlM0MvdGV4dCUzRSUzQy9zdmclM0UiLAogICAgICAic2l6ZXMiOiAiMTkyeDE5MiIsCiAgICAgICJ0eXBlIjogImltYWdlL3N2Zyt4bWwiCiAgICB9LAogICAgewogICAgICAic3JjIjogImRhdGE6aW1hZ2Uvc3ZnK3htbCwlM0NzdmcgeG1sbnM9J2h0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnJyB3aWR0aD0nNTEyJyBoZWlnaHQ9JzUxMic%2BJTNDcmVjdCB3aWR0aD0nNTEyJyBoZWlnaHQ9JzUxMicgZmlsbD0nJTIzMWUzYThhJy8%2BJTNDdGV4dCB4PSc1MCUyNScgeT0nNTAlMjUnIGZvbnQtc2l6ZT0nMjQwJyBmaWxsPSclMjNmYmI2MTcnIGZvbnQtZmFtaWx5PSdBcmlhbCcgdGV4dC1hbmNob3I9J21pZGRsZScgZG9taW5hbnQtYmFzZWxpbmU9J21pZGRsZSclM0VEJTNDL3RleHQlM0UlM0Mvc3ZnJTNFIiwKICAgICAgInNpemVzIjogIjUxMng1MTIiLAogICAgICAidHlwZSI6ICJpbWFnZS9zdmcreG1sIgogICAgfQogIF0KfQ==">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Courier New', monospace;
+        }
+
+        body {
+            background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 50%, #eab308 100%);
+            min-height: 100vh;
+            overflow-x: hidden;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .container {
+            max-width: 100%;
+            padding: 16px;
+            padding-bottom: 80px;
+        }
+
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 16px 0;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            text-align: center;
+        }
+
+        .header h1 {
+            color: #1e3a8a;
+            font-size: 32px;
+            margin-bottom: 8px;
+        }
+
+        .header .subtitle {
+            color: #eab308;
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .header .tagline {
+            color: #666;
+            font-size: 14px;
+            margin-top: 8px;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin-bottom: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            transition: transform 0.2s;
+        }
+
+        .btn:active {
+            transform: scale(0.98);
+        }
+
+        .btn-primary {
+            background: #1e3a8a;
+            color: #fbbf24;
+        }
+
+        .btn-secondary {
+            background: #fbbf24;
+            color: #1e3a8a;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+
+        .card h2 {
+            color: #1e3a8a;
+            font-size: 20px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            color: #333;
+            font-weight: bold;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #1e3a8a;
+        }
+
+        .button-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .option-btn {
+            padding: 16px 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            background: white;
+            color: #666;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 14px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.2s;
+        }
+
+        .option-btn.active {
+            border-color: #1e3a8a;
+            background: #eff6ff;
+            color: #1e3a8a;
+        }
+
+        .option-btn:active {
+            transform: scale(0.98);
+        }
+
+        .account-info {
+            background: #fef3c7;
+            border: 2px solid #fbbf24;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .account-info h3 {
+            color: #1e3a8a;
+            font-size: 16px;
+            margin-bottom: 12px;
+        }
+
+        .account-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+
+        .account-row span:first-child {
+            color: #666;
+        }
+
+        .account-row span:last-child {
+            color: #1e3a8a;
+            font-weight: bold;
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 13px;
+        }
+
+        .alert-warning {
+            background: #fef2f2;
+            border: 1px solid #ef4444;
+            color: #991b1b;
+        }
+
+        .alert-success {
+            background: #d1fae5;
+            border: 1px solid #10b981;
+            color: #065f46;
+        }
+
+        .alert-info {
+            background: #dbeafe;
+            border: 1px solid #3b82f6;
+            color: #1e40af;
+        }
+
+        .activity-item {
+            background: #fef3c7;
+            border-left: 4px solid #fbbf24;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            color: #333;
+        }
+
+        .empty-state {
+            text-align: center;
+            color: #999;
+            padding: 24px;
+            font-size: 14px;
+        }
+
+        .footer {
+            text-align: center;
+            color: white;
+            padding: 16px;
+            font-size: 12px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .ride-summary {
+            background: #eff6ff;
+            border: 1px solid #3b82f6;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .ride-summary h3 {
+            color: #1e3a8a;
+            margin-bottom: 12px;
+            font-size: 16px;
+        }
+
+        .ride-summary p {
+            font-size: 13px;
+            color: #333;
+            margin-bottom: 6px;
+        }
+
+        .icon {
+            width: 20px;
+            height: 20px;
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>DUH-ROAD</h1>
+            <div class="subtitle">Bike Taxi Service</div>
+            <div class="tagline">Fast, Reliable, Affordable Transportation</div>
+        </div>
+
+        <!-- Call Buttons -->
+        <button class="btn btn-primary" onclick="handleCall()">
+            📞 Call Now
+        </button>
+        
+        <button class="btn btn-secondary" onclick="handleCallback()">
+            📞 Request Callback
+        </button>
+
+        <!-- WhatsApp Buttons -->
+        <button class="btn btn-primary" onclick="handleWhatsAppBusiness()">
+            💬 Chat on WhatsApp
+        </button>
+        
+        <button class="btn btn-secondary" onclick="handleWhatsAppUser()">
+            💬 Send WhatsApp to Me
+        </button>
+
+        <!-- Main Form -->
+        <div class="card" id="mainForm">
+            <h2>📝 Sign Up for Service</h2>
+            
+            <div id="successMessage" class="alert alert-success hidden">
+                ✅ Successfully registered! We'll contact you soon.
+            </div>
+
+            <div id="bookingForm">
+                <div class="form-group">
+                    <label>Full Name</label>
+                    <input type="text" id="name" placeholder="Enter your name">
+                </div>
+
+                <div class="form-group">
+                    <label>📍 Pickup Location</label>
+                    <input type="text" id="pickupLocation" placeholder="Enter pickup location">
+                </div>
+
+                <div class="form-group">
+                    <label>📍 Drop-off Destination</label>
+                    <input type="text" id="dropoffDestination" placeholder="Enter drop-off destination">
+                </div>
+
+                <div class="form-group">
+                    <label>Trip Type</label>
+                    <div class="button-group">
+                        <button class="option-btn" id="oneWayBtn" onclick="selectTripType(&#39;one-way&#39;)">
+                            <span>→</span>
+                            <span>One Way</span>
+                        </button>
+                        <button class="option-btn" id="returnBtn" onclick="selectTripType(&#39;return&#39;)">
+                            <span>⟷</span>
+                            <span>Return Trip</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Contact Number</label>
+                    <input type="tel" id="contactNumber" placeholder="Enter your phone number">
+                </div>
+
+                <div class="form-group">
+                    <label>Brief Description of Attire</label>
+                    <input type="text" id="attire" placeholder="e.g., Blue shirt, black pants">
+                </div>
+
+                <div class="form-group">
+                    <label>Payment Method</label>
+                    <div class="button-group">
+                        <button class="option-btn" id="cashBtn" onclick="selectPayment(&#39;cash&#39;)">
+                            <span>💵</span>
+                            <span>Cash</span>
+                        </button>
+                        <button class="option-btn" id="cardBtn" onclick="selectPayment(&#39;card&#39;)">
+                            <span>💳</span>
+                            <span>Card</span>
+                        </button>
+                    </div>
+                    <div id="cashMessage" class="alert alert-success hidden" style="margin-top: 12px;">
+                        ✓ Cash payment selected - Complete form to register
+                    </div>
+                    <div id="cardMessage" class="alert alert-info hidden" style="margin-top: 12px;">
+                        ⚠ Card payment selected - You must complete payment before registering
+                    </div>
+                </div>
+
+                <div id="accountInfo" class="account-info hidden">
+                    <h3>💳 Transfer Payment to This Account</h3>
+                    <div class="account-row">
+                        <span>Account Number:</span>
+                        <span>305191094</span>
+                    </div>
+                    <div class="account-row">
+                        <span>Account Name:</span>
+                        <span>Stanfford Christopher Taylor</span>
+                    </div>
+                    <div class="account-row">
+                        <span>Account Type:</span>
+                        <span>Savings</span>
+                    </div>
+                    <div class="account-row">
+                        <span>Bank:</span>
+                        <span>NCB Half Way Tree</span>
+                    </div>
+                    <div class="alert alert-warning" style="margin-top: 12px;">
+                        <strong>⚠ IMPORTANT:</strong> You MUST transfer payment to the account above BEFORE proceeding. After payment, click "Proceed to Payment Confirmation" below.
+                    </div>
+                </div>
+
+                <button class="btn btn-primary" id="submitBtn" onclick="handleSubmit()">
+                    Register Now
+                </button>
+            </div>
+        </div>
+
+        <!-- Payment Form -->
+        <div class="card hidden" id="paymentForm">
+            <h2>💳 Payment Confirmation</h2>
+
+            <div class="ride-summary">
+                <h3>Ride Summary</h3>
+                <p><strong>Passenger:</strong> <span id="summaryName"></span></p>
+                <p><strong>From:</strong> <span id="summaryPickup"></span></p>
+                <p><strong>To:</strong> <span id="summaryDropoff"></span></p>
+                <p><strong>Trip Type:</strong> <span id="summaryTripType"></span></p>
+            </div>
+
+            <h3 style="color: #1e3a8a; margin-bottom: 16px; font-size: 18px;">Enter Payment Details</h3>
+
+            <div class="form-group">
+                <label>Your Name (as shown in bank)</label>
+                <input type="text" id="senderName" placeholder="Enter your full name">
+            </div>
+
+            <div class="form-group">
+                <label>Your Address</label>
+                <input type="text" id="senderAddress" placeholder="Enter your address">
+            </div>
+
+            <div class="form-group">
+                <label>Your Bank</label>
+                <select id="senderBank">
+                    <option value="">Select your bank</option>
+                    <option value="JNCB (Jamaica National Commercial Bank)">JNCB (Jamaica National Commercial Bank)</option>
+                    <option value="JN Bank">JN Bank</option>
+                    <option value="Sagicor Bank">Sagicor Bank</option>
+                    <option value="VMBS (Victoria Mutual Building Society)">VMBS (Victoria Mutual Building Society)</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Amount Paid (JMD $)</label>
+                <input type="number" id="amountPaid" placeholder="Enter amount paid" min="0" step="0.01">
+            </div>
+
+            <div class="button-group">
+                <button class="btn" style="background: #9ca3af; color: white;" onclick="backToForm()">
+                    Back
+                </button>
+                <button class="btn btn-primary" onclick="handlePaymentSubmit()">
+                    Send Receipt
+                </button>
+            </div>
+        </div>
+
+        <!-- Activity Alerts -->
+        <div class="card">
+            <h2>🔔 Activity Alerts</h2>
+            <div id="activityList">
+                <div class="empty-state">No recent activities</div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>© 2024 DUH-ROAD Bike Taxi. All rights reserved.</p>
+            <p style="margin-top: 8px;">Business Hours: 24/7 | Emergency Contact: 1876-409-5941</p>
+        </div>
+    </div>
+
+    <script>
+        const businessNumber = '1876-409-5941';
+        const businessWhatsApp = '18765172964';
+        let formData = {
+            name: '',
+            pickupLocation: '',
+            dropoffDestination: '',
+            contactNumber: '',
+            attire: '',
+            paymentMethod: '',
+            tripType: ''
+        };
+        let activities = [];
+
+        // Service Worker Registration
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('data:text/javascript;base64,c2VsZi5hZGRFdmVudExpc3RlbmVyKCdpbnN0YWxsJywgZnVuY3Rpb24oZSkge30pOw==');
+        }
+
+        function selectTripType(type) {
+            formData.tripType = type;
+            document.getElementById('oneWayBtn').classList.remove('active');
+            document.getElementById('returnBtn').classList.remove('active');
+            if (type === 'one-way') {
+                document.getElementById('oneWayBtn').classList.add('active');
+            } else {
+                document.getElementById('returnBtn').classList.add('active');
+            }
+        }
+
+        function selectPayment(method) {
+            formData.paymentMethod = method;
+            document.getElementById('cashBtn').classList.remove('active');
+            document.getElementById('cardBtn').classList.remove('active');
+            document.getElementById('cashMessage').classList.add('hidden');
+            document.getElementById('cardMessage').classList.add('hidden');
+            document.getElementById('accountInfo').classList.add('hidden');
+
+            if (method === 'cash') {
+                document.getElementById('cashBtn').classList.add('active');
+                document.getElementById('cashMessage').classList.remove('hidden');
+                document.getElementById('submitBtn').textContent = 'Register Now';
+            } else {
+                document.getElementById('cardBtn').classList.add('active');
+                document.getElementById('cardMessage').classList.remove('hidden');
+                document.getElementById('accountInfo').classList.remove('hidden');
+                document.getElementById('submitBtn').textContent = 'Proceed to Payment Confirmation';
+            }
+        }
+
+        function handleCall() {
+            addActivity(`Call initiated at ${new Date().toLocaleString()}`);
+            window.location.href = `tel:${businessNumber}`;
+        }
+
+        function handleCallback() {
+            const timestamp = new Date().toLocaleString();
+            addActivity(`Callback requested at ${timestamp}`);
+            const message = encodeURIComponent(
+                `📞 CALLBACK REQUEST\n\n` +
+                `Please call me back!\n` +
+                `Time: ${timestamp}`
+            );
+            window.open(`https://wa.me/${businessWhatsApp}?text=${message}`, '_blank');
+        }
+
+        function handleWhatsAppBusiness() {
+            addActivity(`WhatsApp business chat opened at ${new Date().toLocaleString()}`);
+            window.open(`https://wa.me/${businessWhatsApp}`, '_blank');
+        }
+
+        function handleWhatsAppUser() {
+            const contactNumber = document.getElementById('contactNumber').value;
+            if (contactNumber) {
+                const cleanNumber = contactNumber.replace(/\D/g, '');
+                window.open(`https://wa.me/${cleanNumber}`, '_blank');
+            } else {
+                alert('Please enter your contact number first');
+            }
+        }
+
+        function handleSubmit() {
+            formData.name = document.getElementById('name').value;
+            formData.pickupLocation = document.getElementById('pickupLocation').value;
+            formData.dropoffDestination = document.getElementById('dropoffDestination').value;
+            formData.contactNumber = document.getElementById('contactNumber').value;
+            formData.attire = document.getElementById('attire').value;
+
+            if (!formData.name || !formData.pickupLocation || !formData.dropoffDestination || 
+                !formData.contactNumber || !formData.attire || !formData.paymentMethod || !formData.tripType) {
+                alert('Please fill in all fields');
+                return;
+            }
+
+            if (formData.paymentMethod === 'card') {
+                // Show payment form
+                document.getElementById('mainForm').classList.add('hidden');
+                document.getElementById('paymentForm').classList.remove('hidden');
+                document.getElementById('summaryName').textContent = formData.name;
+                document.getElementById('summaryPickup').textContent = formData.pickupLocation;
+                document.getElementById('summaryDropoff').textContent = formData.dropoffDestination;
+                document.getElementById('summaryTripType').textContent = formData.tripType === 'one-way' ? 'One Way' : 'Return Trip';
+                window.scrollTo(0, 0);
+                return;
+            }
+
+            // Cash payment - complete registration
+            const timestamp = new Date().toLocaleString();
+            const activity = `New signup: ${formData.name} from ${formData.pickupLocation} to ${formData.dropoffDestination}, Trip: ${formData.tripType.toUpperCase()}, Payment: CASH, Attire: ${formData.attire} at ${timestamp}`;
+            addActivity(activity);
+
+            const message = encodeURIComponent(
+                `🚨 NEW RIDE REQUEST\n\n` +
+                `Name: ${formData.name}\n` +
+                `Pickup: ${formData.pickupLocation}\n` +
+                `Drop-off: ${formData.dropoffDestination}\n` +
+                `Trip Type: ${formData.tripType.toUpperCase()}\n` +
+                `Contact: ${formData.contactNumber}\n` +
+                `Attire: ${formData.attire}\n` +
+                `Payment: CASH\n` +
+                `Time: ${timestamp}`
+            );
+            window.open(`https://wa.me/${businessWhatsApp}?text=${message}`, '_blank');
+
+            showSuccess();
+        }
+
+        function handlePaymentSubmit() {
+            const senderName = document.getElementById('senderName').value;
+            const senderAddress = document.getElementById('senderAddress').value;
+            const senderBank = document.getElementById('senderBank').value;
+            const amountPaid = document.getElementById('amountPaid').value;
+
+            if (!senderName || !senderAddress || !senderBank || !amountPaid) {
+                alert('Please fill in all payment details');
+                return;
+            }
+
+            const timestamp = new Date().toLocaleString();
+            const activity = `Payment receipt: ${senderName} paid $${amountPaid} from ${senderBank} at ${timestamp}`;
+            addActivity(activity);
+
+            const receiptMessage = encodeURIComponent(
+                `💳 PAYMENT RECEIPT\n\n` +
+                `--- RIDE DETAILS ---\n` +
+                `Passenger: ${formData.name}\n` +
+                `Pickup: ${formData.pickupLocation}\n` +
+                `Drop-off: ${formData.dropoffDestination}\n` +
+                `Trip Type: ${formData.tripType.toUpperCase()}\n` +
+                `Contact: ${formData.contactNumber}\n` +
+                `Attire: ${formData.attire}\n\n` +
+                `--- PAYMENT DETAILS ---\n` +
+                `Sender Name: ${senderName}\n` +
+                `Sender Address: ${senderAddress}\n` +
+                `Bank: ${senderBank}\n` +
+                `Amount Paid: $${amountPaid}\n` +
+                `Time: ${timestamp}\n\n` +
+                `✅ Payment Confirmed`
+            );
+            window.open(`https://wa.me/${businessWhatsApp}?text=${receiptMessage}`, '_blank');
+
+            // Reset forms
+            document.getElementById('paymentForm').classList.add('hidden');
+            document.getElementById('mainForm').classList.remove('hidden');
+            showSuccess();
+            clearForms();
+        }
+
+        function backToForm() {
+            document.getElementById('paymentForm').classList.add('hidden');
+            document.getElementById('mainForm').classList.remove('hidden');
+            window.scrollTo(0, 0);
+        }
+
+        function showSuccess() {
+            document.getElementById('bookingForm').classList.add('hidden');
+            document.getElementById('successMessage').classList.remove('hidden');
+            window.scrollTo(0, 0);
+            setTimeout(() => {
+                document.getElementById('successMessage').classList.add('hidden');
+                document.getElementById('bookingForm').classList.remove('hidden');
+            }, 3000);
+        }
+
+        function clearForms() {
+            document.getElementById('name').value = '';
+            document.getElementById('pickupLocation').value = '';
+            document.getElementById('dropoffDestination').value = '';
+            document.getElementById('contactNumber').value = '';
+            document.getElementById('attire').value = '';
+            document.getElementById('senderName').value = '';
+            document.getElementById('senderAddress').value = '';
+            document.getElementById('senderBank').value = '';
+            document.getElementById('amountPaid').value = '';
+            document.getElementById('oneWayBtn').classList.remove('active');
+            document.getElementById('returnBtn').classList.remove('active');
+            document.getElementById('cashBtn').classList.remove('active');
+            document.getElementById('cardBtn').classList.remove('active');
+            document.getElementById('cashMessage').classList.add('hidden');
+            document.getElementById('cardMessage').classList.add('hidden');
+            document.getElementById('accountInfo').classList.add('hidden');
+            formData = {
+                name: '',
+                pickupLocation: '',
+                dropoffDestination: '',
+                contactNumber: '',
+                attire: '',
+                paymentMethod: '',
+                tripType: ''
+            };
+        }
+
+        function addActivity(text) {
+            activities.unshift(text);
+            updateActivityList();
+        }
+
+        function updateActivityList() {
+            const list = document.getElementById('activityList');
+            if (activities.length === 0) {
+                list.innerHTML = '<div class="empty-state">No recent activities</div>';
+            } else {
+                list.innerHTML = activities.map(activity => 
+                    `<div class="activity-item">${activity}</div>`
+                ).join('');
+            }
+        }
+    </script>
+
+</body></html>
